@@ -23,6 +23,7 @@ include "_cygrpc/arguments.pxd.pxi"
 include "_cygrpc/call.pxd.pxi"
 include "_cygrpc/channel.pxd.pxi"
 include "_cygrpc/credentials.pxd.pxi"
+include "_cygrpc/private_key_offload.pxd.pxi"
 include "_cygrpc/completion_queue.pxd.pxi"
 include "_cygrpc/event.pxd.pxi"
 include "_cygrpc/metadata.pxd.pxi"
@@ -39,8 +40,7 @@ include "_cygrpc/_hooks.pxd.pxi"
 
 include "_cygrpc/grpc_gevent.pxd.pxi"
 
-IF UNAME_SYSNAME != "Windows":
-    include "_cygrpc/fork_posix.pxd.pxi"
+include "_cygrpc/fork.pxd.pxi"
 
 # Following pxi files are part of the Aio module
 include "_cygrpc/aio/completion_queue.pxd.pxi"
