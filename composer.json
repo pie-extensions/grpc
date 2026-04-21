@@ -2,7 +2,7 @@
     "name": "pie-extensions/grpc",
     "description": "PIE-compatible mirror of grpc/grpc",
     "type": "php-ext",
-    "version": "1.78.0",
+    "version": "1.78.1",
     "require": {
         "php": ">=8.2"
     },
