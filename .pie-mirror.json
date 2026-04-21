@@ -5,6 +5,13 @@
     },
     "php_ext_name": "grpc",
     "source_dir": "src/",
+    "sync": {
+        "prereleases": false,
+        "initial-versions": 3,
+        "exclude-tags": [
+            ".*-pre\\d+"
+        ]
+    },
     "build": {
         "enabled": true,
         "os": [
@@ -17,19 +24,27 @@
         ],
         "php-version-constraints": [
             {
-                "ext-versions": "*",
-                "php-versions": [
-                    "8.2",
-                    "8.3",
-                    "8.4",
-                    "8.5"
-                ]
+                "ext-versions": "<1.78.0",
+                "php-versions": ["8.2", "8.3", "8.4"]
+            },
+            {
+                "ext-versions": ">=1.78.0",
+                "php-versions": ["8.2", "8.3", "8.4", "8.5"]
             }
         ],
         "zts": [
             "nts",
             "ts"
         ],
-        "build-path": "."
+        "build-path": ".",
+        "configure-flags": "--enable-grpc",
+        "apk-packages": "zlib-dev"
+    },
+    "hooks": {
+        "post-extract": [
+            "git clone --depth 1 -b \"v${PIE_SYNC_VERSION}\" https://github.com/grpc/grpc.git /tmp/grpc-clone && cd /tmp/grpc-clone && git submodule update --init --depth 1 third_party/abseil-cpp third_party/boringssl-with-bazel third_party/re2 && rm -rf third_party/abseil-cpp/.git third_party/boringssl-with-bazel/.git third_party/re2/.git && cp -r third_party/abseil-cpp third_party/boringssl-with-bazel third_party/re2 \"${GITHUB_WORKSPACE}/${PIE_SOURCE_DIR}/third_party/\" && rm -rf /tmp/grpc-clone",
+            "rm -f \"${GITHUB_WORKSPACE}/${PIE_SOURCE_DIR}/build\" \"${GITHUB_WORKSPACE}/${PIE_SOURCE_DIR}/BUILD\"",
+            "sed -i'' -e 's/ -g / /g' \"${GITHUB_WORKSPACE}/${PIE_SOURCE_DIR}/config.m4\""
+        ]
     }
 }
