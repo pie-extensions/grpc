@@ -1,4 +1,4 @@
-# Copyright 2015 The BoringSSL Authors
+# Copyright 2014 The BoringSSL Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,24 +12,208 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This file is created by generate_build_files.py. Do not edit manually.
-
 cmake_minimum_required(VERSION 3.16)
 
-project(BoringSSL LANGUAGES C CXX)
+# Defer enabling C and CXX languages.
+project(BoringSSL NONE)
+
+# Don't install BoringSSL to system directories by default; it has no stable
+# ABI. Instead, default to an "install" directory under the source.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install CACHE PATH "" FORCE)
+endif()
+
+if(WIN32)
+  # On Windows, prefer cl over gcc if both are available. By default most of
+  # the CMake generators prefer gcc, even on Windows.
+  set(CMAKE_GENERATOR_CC cl)
+endif()
+
+include(cmake/go.cmake)
+include(cmake/paths.cmake)
+include(gen/sources.cmake)
+
+enable_language(C)
+enable_language(CXX)
+
+include(GNUInstallDirs)
+
+set(INSTALL_ENABLED 1)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+  find_package(PkgConfig QUIET)
+  if (PkgConfig_FOUND)
+    pkg_check_modules(LIBUNWIND libunwind-generic>=1.3.0)
+    if(LIBUNWIND_FOUND)
+      add_definitions(-DBORINGSSL_HAVE_LIBUNWIND)
+    else()
+      message("libunwind not found. Disabling unwind tests.")
+    endif()
+  else()
+    message("pkgconfig not found. Disabling unwind tests.")
+  endif()
+endif()
+
+string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
+if(NOT FIPS)
+  if(CMAKE_BUILD_TYPE_LOWER STREQUAL "relwithassert" OR
+     NOT CMAKE_BUILD_TYPE_LOWER MATCHES "rel")
+    add_definitions(-DBORINGSSL_DISPATCH_TEST)
+    # CMake automatically connects include_directories to the NASM
+    # command-line, but not add_definitions.
+    set(CMAKE_ASM_NASM_FLAGS "${CMAKE_ASM_NASM_FLAGS} -DBORINGSSL_DISPATCH_TEST")
+  endif()
+endif()
+
+# Add a RelWithAsserts build configuration. It is the same as Release, except it
+# does not define NDEBUG, so asserts run.
+foreach(VAR CMAKE_C_FLAGS CMAKE_CXX_FLAGS CMAKE_ASM_FLAGS)
+  string(REGEX REPLACE "(^| )[/-]DNDEBUG( |$)" " " "${VAR}_RELWITHASSERTS"
+         "${${VAR}_RELEASE}")
+endforeach()
+
+if(BORINGSSL_PREFIX AND BORINGSSL_PREFIX_SYMBOLS)
+  require_go()
+  add_definitions(-DBORINGSSL_PREFIX=${BORINGSSL_PREFIX})
+  # CMake automatically connects include_directories to the NASM command-line,
+  # but not add_definitions.
+  set(CMAKE_ASM_NASM_FLAGS "${CMAKE_ASM_NASM_FLAGS} -DBORINGSSL_PREFIX=${BORINGSSL_PREFIX}")
+
+  # Use "symbol_prefix_include" to store generated header files
+  include_directories(${CMAKE_CURRENT_BINARY_DIR}/symbol_prefix_include)
+  add_custom_command(
+    OUTPUT symbol_prefix_include/boringssl_prefix_symbols.h
+           symbol_prefix_include/boringssl_prefix_symbols_asm.h
+           symbol_prefix_include/boringssl_prefix_symbols_nasm.inc
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/symbol_prefix_include
+    COMMAND ${GO_EXECUTABLE} run ${CMAKE_CURRENT_SOURCE_DIR}/util/make_prefix_headers.go -out ${CMAKE_CURRENT_BINARY_DIR}/symbol_prefix_include ${BORINGSSL_PREFIX_SYMBOLS}
+    DEPENDS util/make_prefix_headers.go
+            ${BORINGSSL_PREFIX_SYMBOLS})
+
+  # add_dependencies needs a target, not a file, so we add an intermediate
+  # target.
+  add_custom_target(
+    boringssl_prefix_symbols
+    DEPENDS symbol_prefix_include/boringssl_prefix_symbols.h
+            symbol_prefix_include/boringssl_prefix_symbols_asm.h
+            symbol_prefix_include/boringssl_prefix_symbols_nasm.inc)
+elseif(BORINGSSL_PREFIX OR BORINGSSL_PREFIX_SYMBOLS)
+  message(FATAL_ERROR "Must specify both or neither of BORINGSSL_PREFIX and BORINGSSL_PREFIX_SYMBOLS")
+else()
+  add_custom_target(boringssl_prefix_symbols)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(CLANG 1)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  set(EMSCRIPTEN 1)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fno-common -fno-exceptions -fno-rtti")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=hidden -fno-common")
-endif()
 
-# pthread_rwlock_t requires a feature flag on glibc.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_XOPEN_SOURCE=700")
+if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
+  # Note clang-cl is odd and sets both CLANG and MSVC. We base our configuration
+  # primarily on our normal Clang one.
+  set(C_CXX_FLAGS "-Werror -Wformat=2 -Wsign-compare -Wwrite-strings -Wvla -Wshadow -Wtype-limits -Wmissing-field-initializers")
+  if(MSVC)
+    # clang-cl sets different default warnings than clang. It also treats -Wall
+    # as -Weverything, to match MSVC. Instead -W3 is the alias for -Wall.
+    # See http://llvm.org/viewvc/llvm-project?view=revision&revision=319116
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -W3 -Wno-unused-parameter -fmsc-version=1900")
+  else()
+    if(EMSCRIPTEN)
+      # emscripten's emcc/clang does not accept the "-ggdb" flag.
+      set(C_CXX_FLAGS "${C_CXX_FLAGS} -g")
+    else()
+      set(C_CXX_FLAGS "${C_CXX_FLAGS} -ggdb")
+    endif()
+
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wall -fvisibility=hidden -fno-common")
+  endif()
+
+  if(CLANG)
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wnewline-eof -Wextra-semi -fcolor-diagnostics")
+  else()
+    # GCC (at least 4.8.4) has a bug where it'll find unreachable free() calls
+    # and declare that the code is trying to free a stack pointer.
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wno-free-nonheap-object")
+  endif()
+
+  # -Wstring-concatenation was added in Clang 12.0.0, which corresponds to
+  # AppleClang 13.0.0 per the table in
+  # https://en.wikipedia.org/wiki/Xcode#Toolchain_versions
+  if((CMAKE_C_COMPILER_ID STREQUAL "Clang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "12.0.0") OR
+     (CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0.0"))
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wstring-concatenation")
+  endif()
+
+  # Clang 12's -Wframe-larger-than reportedly does not work in clang-cl. See
+  # https://crbug.com/boringssl/709. Clang 13 includes the following fix, which
+  # may be related. Speculatively gate on Clang 13. That corresponds to
+  # AppleClang 13.1.6.
+  # https://github.com/llvm/llvm-project/commit/6aaf4fa2885600b0e31042071ad06f78218ab0f2
+  if((CMAKE_C_COMPILER_ID STREQUAL "Clang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0.0") OR
+     (CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "13.1.6"))
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wframe-larger-than=25344")
+  endif()
+
+  # -Wctad-maybe-unsupported was added in Clang 10, which is AppleClang 12.0.0.
+  if((CMAKE_C_COMPILER_ID STREQUAL "Clang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "10.0.0") OR
+     (CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "12.0.0"))
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wctad-maybe-unsupported")
+  endif()
+
+  if(CLANG OR CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "7.0.0")
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wimplicit-fallthrough")
+  endif()
+
+  if(CMAKE_COMPILER_IS_GNUCXX)
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wformat-signedness")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_CXX_FLAGS} -Wmissing-prototypes -Wold-style-definition -Wstrict-prototypes")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_CXX_FLAGS} -Wmissing-declarations -Wnon-virtual-dtor")
+
+  # In GCC, -Wmissing-declarations is the C++ spelling of -Wmissing-prototypes
+  # and using the wrong one is an error. In Clang, -Wmissing-prototypes is the
+  # spelling for both and -Wmissing-declarations is some other warning.
+  #
+  # https://gcc.gnu.org/onlinedocs/gcc-7.1.0/gcc/Warning-Options.html#Warning-Options
+  # https://clang.llvm.org/docs/DiagnosticsReference.html#wmissing-prototypes
+  # https://clang.llvm.org/docs/DiagnosticsReference.html#wmissing-declarations
+  if(CLANG)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wmissing-prototypes")
+  endif()
+elseif(MSVC)
+  set(MSVC_DISABLED_WARNINGS_LIST
+      "C4100" # 'exarg' : unreferenced formal parameter
+      "C4127" # conditional expression is constant
+      "C4244" # 'function' : conversion from 'int' to 'uint8_t',
+              # possible loss of data
+      "C4267" # conversion from 'size_t' to 'int', possible loss of data
+      "C4702" # unreachable code; MSVC's warning is too aggressive. See
+              # https://crbug.com/385161043
+      "C4706" # assignment within conditional expression
+      )
+  string(REPLACE "C" " -wd" MSVC_DISABLED_WARNINGS_STR
+                            ${MSVC_DISABLED_WARNINGS_LIST})
+  set(CMAKE_C_FLAGS   "-utf-8 -W4 -WX ${MSVC_DISABLED_WARNINGS_STR}")
+  # Without /Zc:__cplusplus, MSVC does not define the right value for
+  # __cplusplus. See https://devblogs.microsoft.com/cppblog/msvc-now-correctly-reports-__cplusplus/
+  # If this becomes too problematic for downstream code, we can look at
+  # _MSVC_LANG.
+  set(CMAKE_CXX_FLAGS "-utf-8 -W4 -WX ${MSVC_DISABLED_WARNINGS_STR} -Zc:__cplusplus")
 endif()
 
 if(WIN32)
@@ -40,11 +224,151 @@ if(WIN32)
   add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 endif()
 
+# pthread_rwlock_t on Linux requires a feature flag. We limit this to Linux
+# because, on Apple platforms, it instead disables APIs we use. See compat(5)
+# and sys/cdefs.h. Reportedly, FreeBSD also breaks when this is set. See
+# https://crbug.com/boringssl/471.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_XOPEN_SOURCE=700")
+endif()
+
+if(FUZZ)
+  if(NOT CLANG)
+    message(FATAL_ERROR "You need to build with Clang for fuzzing to work")
+  endif()
+
+  if(CMAKE_C_COMPILER_VERSION VERSION_LESS "6.0.0")
+    message(FATAL_ERROR "You need Clang ≥ 6.0.0")
+  endif()
+
+  add_definitions(-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+  set(RUNNER_ARGS "-deterministic" "-fuzzer" "-shim-config" "fuzzer_mode.json")
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address,fuzzer-no-link -fsanitize-coverage=edge,indirect-calls")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address,fuzzer-no-link -fsanitize-coverage=edge,indirect-calls")
+endif()
+
 add_definitions(-DBORINGSSL_IMPLEMENTATION)
+
+if(BUILD_SHARED_LIBS)
+  add_definitions(-DBORINGSSL_SHARED_LIBRARY)
+  # Enable position-independent code globally. This is needed because
+  # some library targets are OBJECT libraries.
+  set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
+endif()
+
+if(MSAN)
+  if(NOT CLANG)
+    message(FATAL_ERROR "Cannot enable MSAN unless using Clang")
+  endif()
+
+  if(ASAN)
+    message(FATAL_ERROR "ASAN and MSAN are mutually exclusive")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer")
+  set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer")
+endif()
+
+if(ASAN)
+  if(NOT CLANG)
+    message(FATAL_ERROR "Cannot enable ASAN unless using Clang")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fsanitize-address-use-after-scope -fno-omit-frame-pointer")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize-address-use-after-scope -fno-omit-frame-pointer")
+endif()
+
+if(CFI)
+  if(NOT CLANG)
+    message(FATAL_ERROR "Cannot enable CFI unless using Clang")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=cfi -fno-sanitize-trap=cfi -flto=thin")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=cfi -fno-sanitize-trap=cfi -flto=thin")
+  # We use Chromium's copy of clang, which requires -fuse-ld=lld if building
+  # with -flto. That, in turn, can't handle -ggdb.
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+  string(REPLACE "-ggdb" "-g" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+  string(REPLACE "-ggdb" "-g" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  # -flto causes object files to contain LLVM bitcode. Mixing those with
+  # assembly output in the same static library breaks the linker.
+  set(OPENSSL_NO_ASM "1")
+endif()
+
+if(TSAN)
+  if(NOT CLANG)
+    message(FATAL_ERROR "Cannot enable TSAN unless using Clang")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+endif()
+
+if(UBSAN)
+  if(NOT CLANG)
+    message(FATAL_ERROR "Cannot enable UBSAN unless using Clang")
+  endif()
+
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined")
+
+  if(NOT UBSAN_RECOVER)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-sanitize-recover=undefined")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize-recover=undefined")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fno-sanitize-recover=undefined")
+  endif()
+endif()
+
+if(GCOV)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage")
+endif()
+
+if(FIPS)
+  require_go()
+  add_definitions(-DBORINGSSL_FIPS)
+  if(FIPS_BREAK_TEST)
+    add_definitions("-DBORINGSSL_FIPS_BREAK_${FIPS_BREAK_TEST}=1")
+  endif()
+  # The FIPS integrity check does not work for ASan and MSan builds.
+  if(NOT ASAN AND NOT MSAN)
+    if(BUILD_SHARED_LIBS)
+      set(FIPS_SHARED "1")
+    else()
+      set(FIPS_DELOCATE "1")
+    endif()
+  endif()
+  if(FIPS_SHARED)
+    # The Android CMake files set -ffunction-sections and -fdata-sections,
+    # which is incompatible with FIPS_SHARED.
+    set(CMAKE_C_FLAGS
+        "${CMAKE_C_FLAGS} -fno-function-sections -fno-data-sections")
+    set(CMAKE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS} -fno-function-sections -fno-data-sections")
+  endif()
+endif()
+
+if(OPENSSL_SMALL)
+  add_definitions(-DOPENSSL_SMALL)
+endif()
+
+if(CONSTANT_TIME_VALIDATION)
+  add_definitions(-DBORINGSSL_CONSTANT_TIME_VALIDATION)
+endif()
+
+if(MALLOC_FAILURE_TESTING)
+  add_definitions(-DBORINGSSL_MALLOC_FAILURE_TESTING)
+endif()
 
 if(OPENSSL_NO_ASM)
   add_definitions(-DOPENSSL_NO_ASM)
-else()
+endif()
+
+if(FIPS_DELOCATE OR NOT OPENSSL_NO_ASM)
   # On x86 and x86_64 Windows, we use the NASM output.
   if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64|x86|i[3-6]86")
     enable_language(ASM_NASM)
@@ -52,7 +376,9 @@ else()
     set(CMAKE_ASM_NASM_FLAGS "${CMAKE_ASM_NASM_FLAGS} -gcv8")
   else()
     enable_language(ASM)
-    set(OPENSSL_ASM TRUE)
+    if (NOT OPENSSL_NO_ASM)
+      set(OPENSSL_ASM TRUE)
+    endif()
     # Work around https://gitlab.kitware.com/cmake/cmake/-/issues/20771 in older
     # CMake versions.
     if(APPLE AND CMAKE_VERSION VERSION_LESS 3.19)
@@ -73,523 +399,410 @@ else()
   endif()
 endif()
 
-if(BUILD_SHARED_LIBS)
-  add_definitions(-DBORINGSSL_SHARED_LIBRARY)
-  # Enable position-independent code globally. This is needed because
-  # some library targets are OBJECT libraries.
-  set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
+if(OPENSSL_NO_SSE2_FOR_TESTING)
+  add_definitions(-DOPENSSL_NO_SSE2_FOR_TESTING)
 endif()
 
-set(
-  CRYPTO_SOURCES_ASM
+if(USE_CUSTOM_LIBCXX)
+  if(NOT CLANG)
+    message(FATAL_ERROR "USE_CUSTOM_LIBCXX only supported with Clang")
+  endif()
 
-  src/crypto/curve25519/asm/x25519-asm-arm.S
-  src/crypto/hrss/asm/poly_rq_mul.S
-  src/crypto/poly1305/poly1305_arm_asm.S
-  src/gen/bcm/aes-gcm-avx2-x86_64-apple.S
-  src/gen/bcm/aes-gcm-avx2-x86_64-linux.S
-  src/gen/bcm/aes-gcm-avx512-x86_64-apple.S
-  src/gen/bcm/aes-gcm-avx512-x86_64-linux.S
-  src/gen/bcm/aesni-gcm-x86_64-apple.S
-  src/gen/bcm/aesni-gcm-x86_64-linux.S
-  src/gen/bcm/aesni-x86-apple.S
-  src/gen/bcm/aesni-x86-linux.S
-  src/gen/bcm/aesni-x86_64-apple.S
-  src/gen/bcm/aesni-x86_64-linux.S
-  src/gen/bcm/aesv8-armv7-linux.S
-  src/gen/bcm/aesv8-armv8-apple.S
-  src/gen/bcm/aesv8-armv8-linux.S
-  src/gen/bcm/aesv8-armv8-win.S
-  src/gen/bcm/aesv8-gcm-armv8-apple.S
-  src/gen/bcm/aesv8-gcm-armv8-linux.S
-  src/gen/bcm/aesv8-gcm-armv8-win.S
-  src/gen/bcm/armv4-mont-linux.S
-  src/gen/bcm/armv8-mont-apple.S
-  src/gen/bcm/armv8-mont-linux.S
-  src/gen/bcm/armv8-mont-win.S
-  src/gen/bcm/bn-586-apple.S
-  src/gen/bcm/bn-586-linux.S
-  src/gen/bcm/bn-armv8-apple.S
-  src/gen/bcm/bn-armv8-linux.S
-  src/gen/bcm/bn-armv8-win.S
-  src/gen/bcm/bsaes-armv7-linux.S
-  src/gen/bcm/co-586-apple.S
-  src/gen/bcm/co-586-linux.S
-  src/gen/bcm/ghash-armv4-linux.S
-  src/gen/bcm/ghash-neon-armv8-apple.S
-  src/gen/bcm/ghash-neon-armv8-linux.S
-  src/gen/bcm/ghash-neon-armv8-win.S
-  src/gen/bcm/ghash-ssse3-x86-apple.S
-  src/gen/bcm/ghash-ssse3-x86-linux.S
-  src/gen/bcm/ghash-ssse3-x86_64-apple.S
-  src/gen/bcm/ghash-ssse3-x86_64-linux.S
-  src/gen/bcm/ghash-x86-apple.S
-  src/gen/bcm/ghash-x86-linux.S
-  src/gen/bcm/ghash-x86_64-apple.S
-  src/gen/bcm/ghash-x86_64-linux.S
-  src/gen/bcm/ghashv8-armv7-linux.S
-  src/gen/bcm/ghashv8-armv8-apple.S
-  src/gen/bcm/ghashv8-armv8-linux.S
-  src/gen/bcm/ghashv8-armv8-win.S
-  src/gen/bcm/p256-armv8-asm-apple.S
-  src/gen/bcm/p256-armv8-asm-linux.S
-  src/gen/bcm/p256-armv8-asm-win.S
-  src/gen/bcm/p256-x86_64-asm-apple.S
-  src/gen/bcm/p256-x86_64-asm-linux.S
-  src/gen/bcm/p256_beeu-armv8-asm-apple.S
-  src/gen/bcm/p256_beeu-armv8-asm-linux.S
-  src/gen/bcm/p256_beeu-armv8-asm-win.S
-  src/gen/bcm/p256_beeu-x86_64-asm-apple.S
-  src/gen/bcm/p256_beeu-x86_64-asm-linux.S
-  src/gen/bcm/rdrand-x86_64-apple.S
-  src/gen/bcm/rdrand-x86_64-linux.S
-  src/gen/bcm/rsaz-avx2-apple.S
-  src/gen/bcm/rsaz-avx2-linux.S
-  src/gen/bcm/sha1-586-apple.S
-  src/gen/bcm/sha1-586-linux.S
-  src/gen/bcm/sha1-armv4-large-linux.S
-  src/gen/bcm/sha1-armv8-apple.S
-  src/gen/bcm/sha1-armv8-linux.S
-  src/gen/bcm/sha1-armv8-win.S
-  src/gen/bcm/sha1-x86_64-apple.S
-  src/gen/bcm/sha1-x86_64-linux.S
-  src/gen/bcm/sha256-586-apple.S
-  src/gen/bcm/sha256-586-linux.S
-  src/gen/bcm/sha256-armv4-linux.S
-  src/gen/bcm/sha256-armv8-apple.S
-  src/gen/bcm/sha256-armv8-linux.S
-  src/gen/bcm/sha256-armv8-win.S
-  src/gen/bcm/sha256-x86_64-apple.S
-  src/gen/bcm/sha256-x86_64-linux.S
-  src/gen/bcm/sha512-586-apple.S
-  src/gen/bcm/sha512-586-linux.S
-  src/gen/bcm/sha512-armv4-linux.S
-  src/gen/bcm/sha512-armv8-apple.S
-  src/gen/bcm/sha512-armv8-linux.S
-  src/gen/bcm/sha512-armv8-win.S
-  src/gen/bcm/sha512-x86_64-apple.S
-  src/gen/bcm/sha512-x86_64-linux.S
-  src/gen/bcm/vpaes-armv7-linux.S
-  src/gen/bcm/vpaes-armv8-apple.S
-  src/gen/bcm/vpaes-armv8-linux.S
-  src/gen/bcm/vpaes-armv8-win.S
-  src/gen/bcm/vpaes-x86-apple.S
-  src/gen/bcm/vpaes-x86-linux.S
-  src/gen/bcm/vpaes-x86_64-apple.S
-  src/gen/bcm/vpaes-x86_64-linux.S
-  src/gen/bcm/x86-mont-apple.S
-  src/gen/bcm/x86-mont-linux.S
-  src/gen/bcm/x86_64-mont-apple.S
-  src/gen/bcm/x86_64-mont-linux.S
-  src/gen/bcm/x86_64-mont5-apple.S
-  src/gen/bcm/x86_64-mont5-linux.S
-  src/gen/crypto/aes128gcmsiv-x86_64-apple.S
-  src/gen/crypto/aes128gcmsiv-x86_64-linux.S
-  src/gen/crypto/chacha-armv4-linux.S
-  src/gen/crypto/chacha-armv8-apple.S
-  src/gen/crypto/chacha-armv8-linux.S
-  src/gen/crypto/chacha-armv8-win.S
-  src/gen/crypto/chacha-x86-apple.S
-  src/gen/crypto/chacha-x86-linux.S
-  src/gen/crypto/chacha-x86_64-apple.S
-  src/gen/crypto/chacha-x86_64-linux.S
-  src/gen/crypto/chacha20_poly1305_armv8-apple.S
-  src/gen/crypto/chacha20_poly1305_armv8-linux.S
-  src/gen/crypto/chacha20_poly1305_armv8-win.S
-  src/gen/crypto/chacha20_poly1305_x86_64-apple.S
-  src/gen/crypto/chacha20_poly1305_x86_64-linux.S
-  src/gen/crypto/md5-586-apple.S
-  src/gen/crypto/md5-586-linux.S
-  src/gen/crypto/md5-x86_64-apple.S
-  src/gen/crypto/md5-x86_64-linux.S
-  src/gen/test_support/trampoline-armv4-linux.S
-  src/gen/test_support/trampoline-armv8-apple.S
-  src/gen/test_support/trampoline-armv8-linux.S
-  src/gen/test_support/trampoline-armv8-win.S
-  src/gen/test_support/trampoline-x86-apple.S
-  src/gen/test_support/trampoline-x86-linux.S
-  src/gen/test_support/trampoline-x86_64-apple.S
-  src/gen/test_support/trampoline-x86_64-linux.S
-  src/third_party/fiat/asm/fiat_curve25519_adx_mul.S
-  src/third_party/fiat/asm/fiat_curve25519_adx_square.S
-  src/third_party/fiat/asm/fiat_p256_adx_mul.S
-  src/third_party/fiat/asm/fiat_p256_adx_sqr.S
+  # CMake does not allow installing a library without installing dependencies.
+  # If we installed libcrypto, we'd have to install our custom libc++, which
+  # does not make sense. As this is a test-only configuration, disable
+  # installing.
+  set(INSTALL_ENABLED 0)
+
+  # CMAKE_CXX_FLAGS ends up in the linker flags as well, so use
+  # add_compile_options. There does not appear to be a way to set
+  # language-specific compile-only flags.
+  add_compile_options("-nostdinc++")
+  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
+  include_directories(
+    SYSTEM
+    util/bot/libcxx-config
+    util/bot/libcxx/include
+    util/bot/libcxxabi/include
+  )
+
+  # This is patterned after buildtools/third_party/libc++/BUILD.gn and
+  # buildtools/third_party/libc++abi/BUILD.gn in Chromium.
+
+  file(GLOB LIBCXX_SOURCES "util/bot/libcxx/src/*.cpp")
+  file(GLOB LIBCXXABI_SOURCES "util/bot/libcxxabi/src/*.cpp")
+
+  # This file is meant for exception-less builds.
+  list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/cxa_noexception.cpp")
+  # libc++ also defines new and delete.
+  list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/stdlib_new_delete.cpp")
+  if(TSAN)
+    # ThreadSanitizer tries to intercept these symbols. Skip them to avoid
+    # symbol conflicts.
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/cxa_guard.cpp")
+  endif()
+
+  add_library(libcxxabi ${LIBCXXABI_SOURCES})
+  target_compile_definitions(
+    libcxxabi PRIVATE
+    -D_LIBCPP_ENABLE_CXX17_REMOVED_UNEXPECTED_FUNCTIONS
+  )
+
+  add_library(libcxx ${LIBCXX_SOURCES})
+  if(ASAN OR MSAN OR TSAN)
+    # Sanitizers try to intercept new and delete.
+    target_compile_definitions(
+      libcxx PRIVATE
+      -D_LIBCPP_DISABLE_NEW_DELETE_DEFINITIONS
+    )
+  endif()
+  target_compile_definitions(
+    libcxx PRIVATE
+    -D_LIBCPP_BUILDING_LIBRARY
+    -DLIBCXX_BUILDING_LIBCXXABI
+    -DLIBC_NAMESPACE=bssl_llvm_libc
+  )
+  # LLVM libc++ depends on some shared headers from LLVM libc.
+  target_include_directories(libcxx PRIVATE util/bot/llvm-libc)
+  set_target_properties(
+    libcxx libcxxabi PROPERTIES
+    COMPILE_FLAGS "-Wno-missing-prototypes -Wno-implicit-fallthrough"
+    # libc++ and libc++abi must be built in C++23 mode.
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED TRUE
+  )
+  # libc++abi depends on libc++ internal headers.
+  set_property(TARGET libcxx libcxxabi APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/util/bot/libcxx/src")
+  target_link_libraries(libcxx libcxxabi)
+endif()
+
+# Add minimal googletest targets. The provided one has many side-effects, and
+# googletest has a very straightforward build.
+add_library(
+  boringssl_gtest
+  third_party/googletest/googlemock/src/gmock-all.cc
+  third_party/googletest/googletest/src/gtest-all.cc
+)
+if(USE_CUSTOM_LIBCXX)
+  target_link_libraries(boringssl_gtest libcxx)
+endif()
+target_include_directories(
+    boringssl_gtest
+    PUBLIC
+    third_party/googletest/googlemock/include
+    third_party/googletest/googletest/include
+    PRIVATE
+    third_party/googletest/googlemock
+    third_party/googletest/googletest
 )
 
-set(
-  CRYPTO_SOURCES_NASM
+# Declare a dummy target to build all unit tests. Test targets should inject
+# themselves as dependencies next to the target definition.
+add_custom_target(all_tests)
 
-  src/gen/bcm/aes-gcm-avx2-x86_64-win.asm
-  src/gen/bcm/aes-gcm-avx512-x86_64-win.asm
-  src/gen/bcm/aesni-gcm-x86_64-win.asm
-  src/gen/bcm/aesni-x86-win.asm
-  src/gen/bcm/aesni-x86_64-win.asm
-  src/gen/bcm/bn-586-win.asm
-  src/gen/bcm/co-586-win.asm
-  src/gen/bcm/ghash-ssse3-x86-win.asm
-  src/gen/bcm/ghash-ssse3-x86_64-win.asm
-  src/gen/bcm/ghash-x86-win.asm
-  src/gen/bcm/ghash-x86_64-win.asm
-  src/gen/bcm/p256-x86_64-asm-win.asm
-  src/gen/bcm/p256_beeu-x86_64-asm-win.asm
-  src/gen/bcm/rdrand-x86_64-win.asm
-  src/gen/bcm/rsaz-avx2-win.asm
-  src/gen/bcm/sha1-586-win.asm
-  src/gen/bcm/sha1-x86_64-win.asm
-  src/gen/bcm/sha256-586-win.asm
-  src/gen/bcm/sha256-x86_64-win.asm
-  src/gen/bcm/sha512-586-win.asm
-  src/gen/bcm/sha512-x86_64-win.asm
-  src/gen/bcm/vpaes-x86-win.asm
-  src/gen/bcm/vpaes-x86_64-win.asm
-  src/gen/bcm/x86-mont-win.asm
-  src/gen/bcm/x86_64-mont-win.asm
-  src/gen/bcm/x86_64-mont5-win.asm
-  src/gen/crypto/aes128gcmsiv-x86_64-win.asm
-  src/gen/crypto/chacha-x86-win.asm
-  src/gen/crypto/chacha-x86_64-win.asm
-  src/gen/crypto/chacha20_poly1305_x86_64-win.asm
-  src/gen/crypto/md5-586-win.asm
-  src/gen/crypto/md5-x86_64-win.asm
-  src/gen/test_support/trampoline-x86-win.asm
-  src/gen/test_support/trampoline-x86_64-win.asm
-)
+add_subdirectory(ssl/test)
+add_subdirectory(util/fipstools)
+add_subdirectory(util/fipstools/acvp/modulewrapper)
 
 if(OPENSSL_ASM)
-  list(APPEND CRYPTO_SOURCES_ASM_USED ${CRYPTO_SOURCES_ASM})
-endif()
-if(OPENSSL_NASM)
-  list(APPEND CRYPTO_SOURCES_ASM_USED ${CRYPTO_SOURCES_NASM})
-endif()
-
-add_library(
-  crypto
-
-  ${CRYPTO_SOURCES_ASM_USED}
-  src/crypto/aes/aes.cc
-  src/crypto/asn1/a_bitstr.cc
-  src/crypto/asn1/a_bool.cc
-  src/crypto/asn1/a_d2i_fp.cc
-  src/crypto/asn1/a_dup.cc
-  src/crypto/asn1/a_gentm.cc
-  src/crypto/asn1/a_i2d_fp.cc
-  src/crypto/asn1/a_int.cc
-  src/crypto/asn1/a_mbstr.cc
-  src/crypto/asn1/a_object.cc
-  src/crypto/asn1/a_octet.cc
-  src/crypto/asn1/a_strex.cc
-  src/crypto/asn1/a_strnid.cc
-  src/crypto/asn1/a_time.cc
-  src/crypto/asn1/a_type.cc
-  src/crypto/asn1/a_utctm.cc
-  src/crypto/asn1/asn1_lib.cc
-  src/crypto/asn1/asn1_par.cc
-  src/crypto/asn1/asn_pack.cc
-  src/crypto/asn1/f_int.cc
-  src/crypto/asn1/f_string.cc
-  src/crypto/asn1/posix_time.cc
-  src/crypto/asn1/tasn_dec.cc
-  src/crypto/asn1/tasn_enc.cc
-  src/crypto/asn1/tasn_fre.cc
-  src/crypto/asn1/tasn_new.cc
-  src/crypto/asn1/tasn_typ.cc
-  src/crypto/asn1/tasn_utl.cc
-  src/crypto/base64/base64.cc
-  src/crypto/bio/bio.cc
-  src/crypto/bio/bio_mem.cc
-  src/crypto/bio/connect.cc
-  src/crypto/bio/errno.cc
-  src/crypto/bio/fd.cc
-  src/crypto/bio/file.cc
-  src/crypto/bio/hexdump.cc
-  src/crypto/bio/pair.cc
-  src/crypto/bio/printf.cc
-  src/crypto/bio/socket.cc
-  src/crypto/bio/socket_helper.cc
-  src/crypto/blake2/blake2.cc
-  src/crypto/bn/bn_asn1.cc
-  src/crypto/bn/convert.cc
-  src/crypto/bn/div.cc
-  src/crypto/bn/exponentiation.cc
-  src/crypto/bn/sqrt.cc
-  src/crypto/buf/buf.cc
-  src/crypto/bytestring/asn1_compat.cc
-  src/crypto/bytestring/ber.cc
-  src/crypto/bytestring/cbb.cc
-  src/crypto/bytestring/cbs.cc
-  src/crypto/bytestring/unicode.cc
-  src/crypto/chacha/chacha.cc
-  src/crypto/cipher/derive_key.cc
-  src/crypto/cipher/e_aesctrhmac.cc
-  src/crypto/cipher/e_aeseax.cc
-  src/crypto/cipher/e_aesgcmsiv.cc
-  src/crypto/cipher/e_chacha20poly1305.cc
-  src/crypto/cipher/e_des.cc
-  src/crypto/cipher/e_null.cc
-  src/crypto/cipher/e_rc2.cc
-  src/crypto/cipher/e_rc4.cc
-  src/crypto/cipher/e_tls.cc
-  src/crypto/cipher/get_cipher.cc
-  src/crypto/cipher/tls_cbc.cc
-  src/crypto/cms/cms.cc
-  src/crypto/conf/conf.cc
-  src/crypto/cpu_aarch64_apple.cc
-  src/crypto/cpu_aarch64_fuchsia.cc
-  src/crypto/cpu_aarch64_linux.cc
-  src/crypto/cpu_aarch64_openbsd.cc
-  src/crypto/cpu_aarch64_sysreg.cc
-  src/crypto/cpu_aarch64_win.cc
-  src/crypto/cpu_arm_freebsd.cc
-  src/crypto/cpu_arm_linux.cc
-  src/crypto/cpu_intel.cc
-  src/crypto/crypto.cc
-  src/crypto/curve25519/curve25519.cc
-  src/crypto/curve25519/curve25519_64_adx.cc
-  src/crypto/curve25519/spake25519.cc
-  src/crypto/des/des.cc
-  src/crypto/dh/dh_asn1.cc
-  src/crypto/dh/params.cc
-  src/crypto/digest/digest_extra.cc
-  src/crypto/dsa/dsa.cc
-  src/crypto/dsa/dsa_asn1.cc
-  src/crypto/ec/ec_asn1.cc
-  src/crypto/ec/ec_derive.cc
-  src/crypto/ec/hash_to_curve.cc
-  src/crypto/ecdh/ecdh.cc
-  src/crypto/ecdsa/ecdsa_asn1.cc
-  src/crypto/engine/engine.cc
-  src/crypto/err/err.cc
-  src/crypto/evp/evp.cc
-  src/crypto/evp/evp_asn1.cc
-  src/crypto/evp/evp_ctx.cc
-  src/crypto/evp/p_dh.cc
-  src/crypto/evp/p_dh_asn1.cc
-  src/crypto/evp/p_dsa_asn1.cc
-  src/crypto/evp/p_ec.cc
-  src/crypto/evp/p_ec_asn1.cc
-  src/crypto/evp/p_ed25519.cc
-  src/crypto/evp/p_ed25519_asn1.cc
-  src/crypto/evp/p_hkdf.cc
-  src/crypto/evp/p_rsa.cc
-  src/crypto/evp/p_rsa_asn1.cc
-  src/crypto/evp/p_x25519.cc
-  src/crypto/evp/p_x25519_asn1.cc
-  src/crypto/evp/pbkdf.cc
-  src/crypto/evp/print.cc
-  src/crypto/evp/scrypt.cc
-  src/crypto/evp/sign.cc
-  src/crypto/ex_data.cc
-  src/crypto/fipsmodule/bcm.cc
-  src/crypto/fipsmodule/fips_shared_support.cc
-  src/crypto/fuzzer_mode.cc
-  src/crypto/hpke/hpke.cc
-  src/crypto/hrss/hrss.cc
-  src/crypto/kyber/kyber.cc
-  src/crypto/lhash/lhash.cc
-  src/crypto/md4/md4.cc
-  src/crypto/md5/md5.cc
-  src/crypto/mem.cc
-  src/crypto/mldsa/mldsa.cc
-  src/crypto/mlkem/mlkem.cc
-  src/crypto/obj/obj.cc
-  src/crypto/obj/obj_xref.cc
-  src/crypto/pem/pem_all.cc
-  src/crypto/pem/pem_info.cc
-  src/crypto/pem/pem_lib.cc
-  src/crypto/pem/pem_oth.cc
-  src/crypto/pem/pem_pk8.cc
-  src/crypto/pem/pem_pkey.cc
-  src/crypto/pem/pem_x509.cc
-  src/crypto/pem/pem_xaux.cc
-  src/crypto/pkcs7/pkcs7.cc
-  src/crypto/pkcs7/pkcs7_x509.cc
-  src/crypto/pkcs8/p5_pbev2.cc
-  src/crypto/pkcs8/pkcs8.cc
-  src/crypto/pkcs8/pkcs8_x509.cc
-  src/crypto/poly1305/poly1305.cc
-  src/crypto/poly1305/poly1305_arm.cc
-  src/crypto/poly1305/poly1305_vec.cc
-  src/crypto/pool/pool.cc
-  src/crypto/rand/deterministic.cc
-  src/crypto/rand/fork_detect.cc
-  src/crypto/rand/forkunsafe.cc
-  src/crypto/rand/getentropy.cc
-  src/crypto/rand/ios.cc
-  src/crypto/rand/passive.cc
-  src/crypto/rand/rand.cc
-  src/crypto/rand/trusty.cc
-  src/crypto/rand/urandom.cc
-  src/crypto/rand/windows.cc
-  src/crypto/rc4/rc4.cc
-  src/crypto/refcount.cc
-  src/crypto/rsa/rsa_asn1.cc
-  src/crypto/rsa/rsa_crypt.cc
-  src/crypto/rsa/rsa_extra.cc
-  src/crypto/rsa/rsa_print.cc
-  src/crypto/sha/sha1.cc
-  src/crypto/sha/sha256.cc
-  src/crypto/sha/sha512.cc
-  src/crypto/siphash/siphash.cc
-  src/crypto/slhdsa/slhdsa.cc
-  src/crypto/spake2plus/spake2plus.cc
-  src/crypto/stack/stack.cc
-  src/crypto/thread.cc
-  src/crypto/thread_none.cc
-  src/crypto/thread_pthread.cc
-  src/crypto/thread_win.cc
-  src/crypto/trust_token/pmbtoken.cc
-  src/crypto/trust_token/trust_token.cc
-  src/crypto/trust_token/voprf.cc
-  src/crypto/x509/a_digest.cc
-  src/crypto/x509/a_sign.cc
-  src/crypto/x509/a_verify.cc
-  src/crypto/x509/algorithm.cc
-  src/crypto/x509/asn1_gen.cc
-  src/crypto/x509/by_dir.cc
-  src/crypto/x509/by_file.cc
-  src/crypto/x509/i2d_pr.cc
-  src/crypto/x509/name_print.cc
-  src/crypto/x509/policy.cc
-  src/crypto/x509/rsa_pss.cc
-  src/crypto/x509/t_crl.cc
-  src/crypto/x509/t_req.cc
-  src/crypto/x509/t_x509.cc
-  src/crypto/x509/t_x509a.cc
-  src/crypto/x509/v3_akey.cc
-  src/crypto/x509/v3_akeya.cc
-  src/crypto/x509/v3_alt.cc
-  src/crypto/x509/v3_bcons.cc
-  src/crypto/x509/v3_bitst.cc
-  src/crypto/x509/v3_conf.cc
-  src/crypto/x509/v3_cpols.cc
-  src/crypto/x509/v3_crld.cc
-  src/crypto/x509/v3_enum.cc
-  src/crypto/x509/v3_extku.cc
-  src/crypto/x509/v3_genn.cc
-  src/crypto/x509/v3_ia5.cc
-  src/crypto/x509/v3_info.cc
-  src/crypto/x509/v3_int.cc
-  src/crypto/x509/v3_lib.cc
-  src/crypto/x509/v3_ncons.cc
-  src/crypto/x509/v3_ocsp.cc
-  src/crypto/x509/v3_pcons.cc
-  src/crypto/x509/v3_pmaps.cc
-  src/crypto/x509/v3_prn.cc
-  src/crypto/x509/v3_purp.cc
-  src/crypto/x509/v3_skey.cc
-  src/crypto/x509/v3_utl.cc
-  src/crypto/x509/x509.cc
-  src/crypto/x509/x509_att.cc
-  src/crypto/x509/x509_cmp.cc
-  src/crypto/x509/x509_d2.cc
-  src/crypto/x509/x509_def.cc
-  src/crypto/x509/x509_ext.cc
-  src/crypto/x509/x509_lu.cc
-  src/crypto/x509/x509_obj.cc
-  src/crypto/x509/x509_req.cc
-  src/crypto/x509/x509_set.cc
-  src/crypto/x509/x509_trs.cc
-  src/crypto/x509/x509_txt.cc
-  src/crypto/x509/x509_v3.cc
-  src/crypto/x509/x509_vfy.cc
-  src/crypto/x509/x509_vpm.cc
-  src/crypto/x509/x509cset.cc
-  src/crypto/x509/x509name.cc
-  src/crypto/x509/x509rset.cc
-  src/crypto/x509/x509spki.cc
-  src/crypto/x509/x_algor.cc
-  src/crypto/x509/x_all.cc
-  src/crypto/x509/x_attrib.cc
-  src/crypto/x509/x_crl.cc
-  src/crypto/x509/x_exten.cc
-  src/crypto/x509/x_name.cc
-  src/crypto/x509/x_pubkey.cc
-  src/crypto/x509/x_req.cc
-  src/crypto/x509/x_sig.cc
-  src/crypto/x509/x_spki.cc
-  src/crypto/x509/x_val.cc
-  src/crypto/x509/x_x509.cc
-  src/crypto/x509/x_x509a.cc
-  src/gen/crypto/err_data.cc
-)
-
-target_include_directories(crypto PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
-
-add_library(
-  ssl
-
-  src/ssl/bio_ssl.cc
-  src/ssl/d1_both.cc
-  src/ssl/d1_lib.cc
-  src/ssl/d1_pkt.cc
-  src/ssl/d1_srtp.cc
-  src/ssl/dtls_method.cc
-  src/ssl/dtls_record.cc
-  src/ssl/encrypted_client_hello.cc
-  src/ssl/extensions.cc
-  src/ssl/handoff.cc
-  src/ssl/handshake.cc
-  src/ssl/handshake_client.cc
-  src/ssl/handshake_server.cc
-  src/ssl/s3_both.cc
-  src/ssl/s3_lib.cc
-  src/ssl/s3_pkt.cc
-  src/ssl/ssl_aead_ctx.cc
-  src/ssl/ssl_asn1.cc
-  src/ssl/ssl_buffer.cc
-  src/ssl/ssl_cert.cc
-  src/ssl/ssl_cipher.cc
-  src/ssl/ssl_credential.cc
-  src/ssl/ssl_file.cc
-  src/ssl/ssl_key_share.cc
-  src/ssl/ssl_lib.cc
-  src/ssl/ssl_privkey.cc
-  src/ssl/ssl_session.cc
-  src/ssl/ssl_stat.cc
-  src/ssl/ssl_transcript.cc
-  src/ssl/ssl_versions.cc
-  src/ssl/ssl_x509.cc
-  src/ssl/t1_enc.cc
-  src/ssl/tls13_both.cc
-  src/ssl/tls13_client.cc
-  src/ssl/tls13_enc.cc
-  src/ssl/tls13_server.cc
-  src/ssl/tls_method.cc
-  src/ssl/tls_record.cc
-)
-
-target_link_libraries(ssl crypto)
-
-add_executable(
-  bssl
-
-  src/tool/args.cc
-  src/tool/ciphers.cc
-  src/tool/client.cc
-  src/tool/const.cc
-  src/tool/digest.cc
-  src/tool/fd.cc
-  src/tool/file.cc
-  src/tool/generate_ech.cc
-  src/tool/generate_ed25519.cc
-  src/tool/genrsa.cc
-  src/tool/pkcs12.cc
-  src/tool/rand.cc
-  src/tool/server.cc
-  src/tool/sign.cc
-  src/tool/speed.cc
-  src/tool/tool.cc
-  src/tool/transport_common.cc
-)
-
-target_link_libraries(bssl ssl crypto)
-
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
-  find_package(Threads REQUIRED)
-  target_link_libraries(crypto Threads::Threads)
+  set(CRYPTO_SOURCES_ASM_USED ${CRYPTO_SOURCES_ASM})
+  set(BCM_SOURCES_ASM_USED ${BCM_SOURCES_ASM})
+  set(TEST_SUPPORT_SOURCES_ASM_USED ${TEST_SUPPORT_SOURCES_ASM})
+elseif(OPENSSL_NASM)
+  set(CRYPTO_SOURCES_ASM_USED ${CRYPTO_SOURCES_NASM})
+  set(BCM_SOURCES_ASM_USED ${BCM_SOURCES_NASM})
+  set(TEST_SUPPORT_SOURCES_ASM_USED ${TEST_SUPPORT_SOURCES_NASM})
 endif()
 
+if(FIPS_DELOCATE AND FIPS_SHARED)
+  message(FATAL_ERROR "Can't set both delocate and shared mode for FIPS build")
+endif()
+
+# OSS-Fuzz relies on BORINGSSL_ALLOW_CXX_RUNTIME because -fno-rtti and
+# -fsanitize=vptr are incompatible.
+set(NO_CXX_RUNTIME_FLAGS)
+if(NOT MSVC AND NOT BORINGSSL_ALLOW_CXX_RUNTIME)
+  # Without -fno-exceptions, use of std::unique_ptr emits a call to
+  # std::terminate.
+  set(NO_CXX_RUNTIME_FLAGS -fno-exceptions -fno-rtti)
+endif()
+
+if(FIPS_DELOCATE)
+  add_library(bcm_c_generated_asm STATIC ${BCM_SOURCES})
+  # The C++ code in libcrypto shouldn't depend on libstdc++.
+  target_compile_options(bcm_c_generated_asm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${NO_CXX_RUNTIME_FLAGS}> "-S")
+  add_dependencies(bcm_c_generated_asm boringssl_prefix_symbols)
+  target_include_directories(bcm_c_generated_asm PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  set_target_properties(bcm_c_generated_asm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(CLANG)
+    # Clang warns when passing both -c (from CMake) and -S.
+    target_compile_options(bcm_c_generated_asm PRIVATE "-Wno-unused-command-line-argument")
+  endif()
+
+  set(TARGET_FLAG "")
+  if(CMAKE_ASM_COMPILER_TARGET)
+    set(TARGET_FLAG "--target=${CMAKE_ASM_COMPILER_TARGET}")
+  endif()
+
+  go_executable(delocate boringssl.googlesource.com/boringssl.git/util/fipstools/delocate)
+  add_custom_command(
+    OUTPUT bcm-delocated.S
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/delocate
+            -a $<TARGET_FILE:bcm_c_generated_asm>
+            -o ${CMAKE_CURRENT_BINARY_DIR}/bcm-delocated.S
+            -cc ${CMAKE_ASM_COMPILER}
+            -cc-flags "${TARGET_FLAG} ${CMAKE_ASM_FLAGS}"
+            ${BCM_SOURCES_ASM_USED}
+            ${CRYPTO_HEADERS}
+    DEPENDS bcm_c_generated_asm
+            delocate
+            ${BCM_SOURCES_ASM_USED}
+            ${CRYPTO_HEADERS}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_library(bcm_hashunset STATIC bcm-delocated.S)
+  set_target_properties(bcm_hashunset PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  set_target_properties(bcm_hashunset PROPERTIES LINKER_LANGUAGE C)
+
+  go_executable(inject_hash
+                boringssl.googlesource.com/boringssl.git/util/fipstools/inject_hash)
+  add_custom_command(
+    OUTPUT bcm.o
+    COMMAND ./inject_hash -o bcm.o -in-archive $<TARGET_FILE:bcm_hashunset>
+    DEPENDS bcm_hashunset inject_hash
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
+  set(CRYPTO_FIPS_OBJECTS bcm.o)
+elseif(FIPS_SHARED)
+  if(NOT BUILD_SHARED_LIBS)
+    message(FATAL_ERROR "FIPS_SHARED set but not BUILD_SHARED_LIBS")
+  endif()
+
+  add_library(bcm_library STATIC ${BCM_SOURCES} ${BCM_SOURCES_ASM_USED})
+  # The C++ code in libcrypto shouldn't depend on libstdc++.
+  target_compile_options(bcm_library PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${NO_CXX_RUNTIME_FLAGS}>)
+  add_dependencies(bcm_library boringssl_prefix_symbols)
+  target_include_directories(bcm_library PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+  add_custom_command(
+    OUTPUT bcm.o
+    COMMAND ${CMAKE_LINKER} -r -T ${CMAKE_CURRENT_SOURCE_DIR}/crypto/fipsmodule/fips_shared.lds -o bcm.o --whole-archive $<TARGET_FILE:bcm_library>
+    DEPENDS bcm_library crypto/fipsmodule/fips_shared.lds
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
+  set(CRYPTO_FIPS_OBJECTS bcm.o)
+else()
+  add_library(fipsmodule OBJECT ${BCM_SOURCES} ${BCM_SOURCES_ASM_USED})
+  # The C++ code in libcrypto shouldn't depend on libstdc++.
+  target_compile_options(fipsmodule PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${NO_CXX_RUNTIME_FLAGS}>)
+  add_dependencies(fipsmodule boringssl_prefix_symbols)
+  target_include_directories(fipsmodule PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  set(CRYPTO_FIPS_OBJECTS $<TARGET_OBJECTS:fipsmodule>)
+endif()
+
+add_library(crypto ${CRYPTO_SOURCES} ${CRYPTO_FIPS_OBJECTS} ${CRYPTO_SOURCES_ASM_USED})
+  # The C++ code in libcrypto shouldn't depend on libstdc++.
+target_compile_options(crypto PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${NO_CXX_RUNTIME_FLAGS}>)
+target_include_directories(crypto PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+set_property(TARGET crypto PROPERTY EXPORT_NAME Crypto)
+
+if(FIPS_SHARED)
+  # Rewrite libcrypto.so to inject the correct module hash value. This assumes
+  # UNIX-style library naming, but we only support FIPS mode on Linux anyway.
+  add_custom_command(
+    TARGET crypto POST_BUILD
+    COMMAND ${GO_EXECUTABLE} run
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/fipstools/inject_hash/inject_hash.go
+    -o libcrypto.so -in-object libcrypto.so
+    # The DEPENDS argument to a POST_BUILD rule appears to be ignored. Thus
+    # go_executable isn't used (as it doesn't get built), but we list this
+    # dependency anyway in case it starts working in some CMake version.
+    DEPENDS util/fipstools/inject_hash/inject_hash.go
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
+endif()
+
+add_dependencies(crypto boringssl_prefix_symbols)
 if(WIN32)
   target_link_libraries(crypto ws2_32)
 endif()
 
+# CMAKE_SYSTEM_NAME is "Generic" for embedded OSes:
+# https://cmake.org/cmake/help/book/mastering-cmake/chapter/Cross%20Compiling%20With%20CMake.html#toolchain-files
+#
+# For now we assume embedded OSes do not have threads. Additionally, the Threads
+# package does not work with Android, but Android does not require any extra
+# parameters to link pthreads.
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Generic|Android)$")
+  find_package(Threads REQUIRED)
+  target_link_libraries(crypto Threads::Threads)
+endif()
+
+# Every target depends on crypto, so we add libcxx as a dependency here to
+# simplify injecting it everywhere.
+if(USE_CUSTOM_LIBCXX)
+  target_link_libraries(crypto libcxx)
+endif()
+
+add_library(ssl ${SSL_SOURCES})
+# Although libssl also provides headers that require an include directory, the
+# flag is already specified by libcrypto, so we omit target_include_directories
+# here.
+set_property(TARGET ssl PROPERTY EXPORT_NAME SSL)
+target_link_libraries(ssl crypto)
+
+add_library(decrepit ${DECREPIT_SOURCES})
+target_link_libraries(decrepit ssl crypto)
+
+add_library(test_support_lib STATIC
+            ${TEST_SUPPORT_SOURCES} ${TEST_SUPPORT_SOURCES_ASM_USED})
+if(LIBUNWIND_FOUND)
+  target_compile_options(test_support_lib PRIVATE ${LIBUNWIND_CFLAGS_OTHER})
+  target_include_directories(test_support_lib PRIVATE ${LIBUNWIND_INCLUDE_DIRS})
+  target_link_libraries(test_support_lib ${LIBUNWIND_LDFLAGS})
+endif()
+if(WIN32)
+  target_link_libraries(test_support_lib dbghelp)
+endif()
+target_link_libraries(test_support_lib boringssl_gtest crypto)
+
+# urandom_test is a separate binary because it needs to be able to observe the
+# PRNG initialisation, which means that it can't have other tests running before
+# it does.
+add_executable(urandom_test ${URANDOM_TEST_SOURCES})
+target_link_libraries(urandom_test test_support_lib boringssl_gtest crypto)
+add_dependencies(all_tests urandom_test)
+
+add_executable(crypto_test ${CRYPTO_TEST_SOURCES})
+target_link_libraries(crypto_test test_support_lib boringssl_gtest crypto)
+add_dependencies(all_tests crypto_test)
+
+add_executable(ssl_test ${SSL_TEST_SOURCES})
+target_link_libraries(ssl_test test_support_lib boringssl_gtest ssl crypto)
+add_dependencies(all_tests ssl_test)
+add_executable(decrepit_test ${DECREPIT_TEST_SOURCES})
+target_link_libraries(decrepit_test test_support_lib boringssl_gtest
+                      decrepit ssl crypto)
+add_dependencies(all_tests decrepit_test)
+
+if(APPLE)
+  set(PKI_CXX_FLAGS "-fno-aligned-new")
+endif()
+
+add_library(pki ${PKI_SOURCES})
+target_link_libraries(pki crypto)
+
+add_executable(pki_test ${PKI_TEST_SOURCES})
+target_link_libraries(pki_test test_support_lib boringssl_gtest pki crypto)
+add_dependencies(all_tests pki_test)
+
+set_target_properties(
+  pki pki_test
+  PROPERTIES
+  COMPILE_FLAGS "${PKI_CXX_FLAGS}")
+
+add_executable(bssl ${BSSL_SOURCES})
+target_link_libraries(bssl ssl crypto)
+
+# Historically, targets were built in subdirectories. For compatibility with
+# existing tools, we, for now, copy the targets into the subdirectories. This
+# will be removed sometime in 2024.
+copy_post_build(crypto crypto crypto_test urandom_test)
+copy_post_build(ssl ssl ssl_test)
+copy_post_build(decrepit decrepit decrepit_test)
+copy_post_build(tool bssl)
+
+if(FUZZ)
+  if(LIBFUZZER_FROM_DEPS)
+    file(GLOB LIBFUZZER_SOURCES "util/bot/libFuzzer/*.cpp")
+    add_library(Fuzzer STATIC ${LIBFUZZER_SOURCES})
+    # libFuzzer does not pass our aggressive warnings. It also must be built
+    # without -fsanitize-coverage options or clang crashes.
+    set_target_properties(
+      Fuzzer PROPERTIES
+      COMPILE_FLAGS "-Wno-shadow -Wno-format-nonliteral -Wno-missing-prototypes -fsanitize-coverage=0"
+    )
+  endif()
+
+  add_subdirectory(fuzz)
+endif()
+
+if(RUST_BINDINGS)
+  find_program(BINDGEN_EXECUTABLE bindgen)
+  if(NOT BINDGEN_EXECUTABLE)
+    message(FATAL_ERROR "Could not find bindgen but was asked to generate Rust bindings.")
+  else()
+    add_subdirectory(rust)
+  endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(HANDSHAKER_ARGS "-handshaker-path" $<TARGET_FILE:handshaker>)
+endif()
+
+if(FIPS)
+  add_custom_target(
+    acvp_tests
+    COMMAND ${GO_EXECUTABLE} build -o ${CMAKE_CURRENT_BINARY_DIR}/acvptool
+            boringssl.googlesource.com/boringssl.git/util/fipstools/acvp/acvptool
+    COMMAND ${GO_EXECUTABLE} build -o ${CMAKE_CURRENT_BINARY_DIR}/testmodulewrapper
+            boringssl.googlesource.com/boringssl.git/util/fipstools/acvp/acvptool/testmodulewrapper
+    COMMAND cd util/fipstools/acvp/acvptool/test &&
+            ${GO_EXECUTABLE} run check_expected.go
+            -tool ${CMAKE_CURRENT_BINARY_DIR}/acvptool
+            -module-wrappers modulewrapper:$<TARGET_FILE:modulewrapper>,testmodulewrapper:${CMAKE_CURRENT_BINARY_DIR}/testmodulewrapper
+            -tests tests.json
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    DEPENDS modulewrapper
+    USES_TERMINAL)
+
+  add_custom_target(
+    fips_specific_tests_if_any
+    DEPENDS acvp_tests
+  )
+else()
+  add_custom_target(fips_specific_tests_if_any)
+endif()
+
+file(STRINGS util/go_tests.txt GO_TESTS)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             util/go_tests.txt)
+
+if(GO_EXECUTABLE)
+  add_custom_target(
+      run_tests
+      COMMAND ${CMAKE_COMMAND} -E echo "Running Go tests"
+      COMMAND ${GO_EXECUTABLE} test ${GO_TESTS}
+      COMMAND ${CMAKE_COMMAND} -E echo
+      COMMAND ${CMAKE_COMMAND} -E echo "Running unit tests"
+      COMMAND ${GO_EXECUTABLE} run util/all_tests.go -build-dir
+              ${CMAKE_CURRENT_BINARY_DIR}
+      COMMAND ${CMAKE_COMMAND} -E echo
+      COMMAND ${CMAKE_COMMAND} -E echo "Running SSL tests"
+      COMMAND cd ssl/test/runner &&
+              ${GO_EXECUTABLE} test -shim-path $<TARGET_FILE:bssl_shim>
+                ${HANDSHAKER_ARGS} ${RUNNER_ARGS}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      DEPENDS all_tests bssl_shim handshaker fips_specific_tests_if_any
+      USES_TERMINAL)
+else()
+  add_custom_target(
+      run_tests
+      COMMAND ${CMAKE_COMMAND} -E echo "Running tests requires Go"
+      COMMAND ${CMAKE_COMMAND} -E false)
+endif()
+
+if(INSTALL_ENABLED)
+  install(TARGETS crypto ssl EXPORT OpenSSLTargets)
+  install(TARGETS bssl)
+  install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(EXPORT OpenSSLTargets
+          FILE OpenSSLTargets.cmake
+          NAMESPACE OpenSSL::
+          DESTINATION lib/cmake/OpenSSL)
+  install(FILES cmake/OpenSSLConfig.cmake DESTINATION lib/cmake/OpenSSL)
+endif()
